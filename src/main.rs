@@ -9,6 +9,8 @@ mod registry;
 mod writer;
 mod watcher;
 mod pipeline;
+mod plugin;
+mod config;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -23,16 +25,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn build(verbose: bool, cache: &DashMap<PathBuf, u64>) -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::current_dir()?;
-    
+
     if !root.join("lib").exists() {
         eprintln!("  Error: Cannot find 'lib/' directory.");
         eprintln!("  Run this command from your Flutter project root.");
         std::process::exit(1);
     }
 
+    let config = config::BuildConfig::load(&root);
+    let registry = plugin::PluginRegistry::with_defaults();
+
     println!("  Scanning...");
-    let result = pipeline::run(&root, verbose, cache)?;
-    
+    let result = pipeline::run(&root, &config, &registry, verbose, cache)?;
+
     let total_processed = result.files_generated + result.files_skipped;
     if total_processed == 0 && result.errors.is_empty() {
         println!("  Scanning...  0 files with @Data() found.\n");
@@ -41,7 +46,7 @@ fn build(verbose: bool, cache: &DashMap<PathBuf, u64>) -> Result<(), Box<dyn std
     }
 
     println!("  Generating...\n");
-    
+
     let mut show_count = 0;
     for (path, _) in &result.generated_content {
         if show_count < 3 {
@@ -49,7 +54,7 @@ fn build(verbose: bool, cache: &DashMap<PathBuf, u64>) -> Result<(), Box<dyn std
             show_count += 1;
         }
     }
-    
+
     if result.generated_content.len() > 3 {
         println!("  ...  ({} more)", result.generated_content.len() - 3);
     }
@@ -59,8 +64,12 @@ fn build(verbose: bool, cache: &DashMap<PathBuf, u64>) -> Result<(), Box<dyn std
     }
 
     if !result.errors.is_empty() {
-        println!("\n  Done with errors. {} ok · {} failed · {}ms", 
-            result.files_generated + result.files_skipped, result.files_failed, result.duration_ms);
+        println!(
+            "\n  Done with errors. {} ok · {} failed · {}ms",
+            result.files_generated + result.files_skipped,
+            result.files_failed,
+            result.duration_ms
+        );
         if !verbose {
             println!("  Run with --verbose to see full error details.");
         }
@@ -83,7 +92,9 @@ fn watch(cache: &DashMap<PathBuf, u64>) -> Result<(), Box<dyn std::error::Error>
         eprintln!("  Run this command from your Flutter project root.");
         std::process::exit(1);
     }
-    watcher::watch(&root, cache)?;
+    let config = config::BuildConfig::load(&root);
+    let registry = plugin::PluginRegistry::with_defaults();
+    watcher::watch(&root, &config, &registry, cache)?;
     Ok(())
 }
 
@@ -126,22 +137,24 @@ mod integration_tests {
             fs::remove_dir_all(root).unwrap();
         }
         fs::create_dir_all(&lib).unwrap();
-        
+
         fs::copy("testdata/simple.dart", lib.join("simple.dart")).unwrap();
         fs::copy("testdata/nested.dart", lib.join("nested.dart")).unwrap();
         fs::copy("testdata/generic.dart", lib.join("generic.dart")).unwrap();
-        
+
         let cache = DashMap::new();
-        let result = pipeline::run(root, false, &cache).unwrap();
-        
+        let config = config::BuildConfig::default();
+        let registry = plugin::PluginRegistry::with_defaults();
+        let result = pipeline::run(root, &config, &registry, false, &cache).unwrap();
+
         assert_eq!(result.files_generated, 3);
         assert_eq!(result.errors.len(), 0);
-        
-        // Run again, should be skipped
-        let result2 = pipeline::run(root, false, &cache).unwrap();
+
+        // Run again — all files should be skipped (content unchanged)
+        let result2 = pipeline::run(root, &config, &registry, false, &cache).unwrap();
         assert_eq!(result2.files_generated, 0);
         assert_eq!(result2.files_skipped, 3);
-        
+
         fs::remove_dir_all(root).unwrap();
     }
 }

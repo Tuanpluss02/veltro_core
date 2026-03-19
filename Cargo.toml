@@ -21,6 +21,11 @@ chrono            = "0.4"
 ctrlc             = "3.4"
 thiserror         = "2.0"
 anyhow            = "1.0"
+serde             = { version = "1", features = ["derive"] }  # ClassIR serialization + config parsing
+serde_json        = "1"                                        # subprocess protocol (v1.5 future use)
+serde_yaml        = "0.9"                                      # reads build.yaml
+glob              = "0.3"                                      # expands include_patterns in scanner
+regex             = "1"                                        # resolves build_extensions path rules
 
 [dev-dependencies]
 pretty_assertions = "1.4"

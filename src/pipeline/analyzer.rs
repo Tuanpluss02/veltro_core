@@ -1,5 +1,6 @@
-use crate::ir::{DataClassIR, FieldIR, TypeKind};
+use crate::ir::{ClassIR, FieldIR, ResolvedKind, AnnotationIR, IR_VERSION};
 use crate::pipeline::parser::ParsedFile;
+use std::collections::HashMap;
 use std::fmt;
 use std::error::Error;
 use tree_sitter::Node;
@@ -7,7 +8,6 @@ use tree_sitter::Node;
 /// Errors that can occur during AST analysis.
 #[derive(Debug)]
 pub enum AnalyzeError {
-    /// The AST structure was not as expected.
     UnexpectedStructure(String),
 }
 
@@ -21,102 +21,119 @@ impl fmt::Display for AnalyzeError {
 
 impl Error for AnalyzeError {}
 
-/// Analyzes a parsed file to extract all DataClassIRs if @Data() is present.
-pub fn analyze(parsed: &ParsedFile) -> Result<Vec<DataClassIR>, AnalyzeError> {
+/// Analyzes a parsed file and extracts all annotated ClassIRs.
+pub fn analyze(parsed: &ParsedFile) -> Result<Vec<ClassIR>, AnalyzeError> {
     let mut results = Vec::new();
-    find_all_data_classes(parsed.tree.root_node(), &parsed.source, &parsed.path, &mut results)?;
+    find_all_annotated_classes(parsed.tree.root_node(), &parsed.source, &parsed.path, &mut results)?;
     Ok(results)
 }
 
-fn find_all_data_classes(node: Node, source: &str, path: &std::path::PathBuf, results: &mut Vec<DataClassIR>) -> Result<(), AnalyzeError> {
-    if (node.kind() == "class_definition" || node.kind() == "class_declaration") && has_data_annotation(node, source) {
-        let name_node = node.child_by_field_name("name");
-        let class_name = name_node
-            .map(|n| n.utf8_text(source.as_bytes()).unwrap_or(""))
-            .unwrap_or("");
-        let expected_mixin = format!("_${}", class_name);
-        let class_text = node.utf8_text(source.as_bytes()).unwrap_or("");
-
-        if !has_with_mixin(class_text, &expected_mixin) {
-            eprintln!(
-                "  ⚠ {} skipped — missing `with _${}`. Add it to enable generation.",
-                class_name, class_name
-            );
-        } else {
-            results.push(extract_data_class(node, source, path.clone())?);
+fn find_all_annotated_classes(
+    node: Node,
+    source: &str,
+    path: &std::path::PathBuf,
+    results: &mut Vec<ClassIR>,
+) -> Result<(), AnalyzeError> {
+    if node.kind() == "class_definition" || node.kind() == "class_declaration" {
+        let annotations = collect_annotations(node, source);
+        if !annotations.is_empty() {
+            results.push(extract_class(node, source, path.clone(), annotations)?);
         }
     }
-    
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        find_all_data_classes(child, source, path, results)?;
+        find_all_annotated_classes(child, source, path, results)?;
     }
-    
+
     Ok(())
 }
 
-/// Checks whether the class text contains `with _$ClassName`.
-fn has_with_mixin(class_text: &str, expected_mixin: &str) -> bool {
-    if let Some(with_idx) = class_text.find("with") {
-        let after_with = &class_text[with_idx + 4..];
-        if let Some(brace_idx) = after_with.find('{') {
-            let mixin_section = &after_with[..brace_idx];
-            return mixin_section.contains(expected_mixin);
-        }
-        return after_with.contains(expected_mixin);
-    }
-    false
-}
+/// Collects all annotations on a class node.
+fn collect_annotations(node: Node, source: &str) -> Vec<AnnotationIR> {
+    let mut annotations = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
 
-fn has_data_annotation(node: Node, source: &str) -> bool {
     // Check own children (new grammar style)
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if (child.kind() == "annotation" || child.kind() == "metadata") && 
-           child.utf8_text(source.as_bytes()).unwrap_or("").trim() == "@Data()" {
-            return true;
+        if child.kind() == "annotation" || child.kind() == "metadata" {
+            let text = child.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+            if let Some(ann) = parse_annotation_text(&text) {
+                if seen_names.insert(ann.name.clone()) {
+                    annotations.push(ann);
+                }
+            }
         }
     }
 
+    // Check previous siblings (some grammar styles place annotations before the class node)
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
         if p.kind() == "annotation" || p.kind() == "metadata" {
-            let text = p.utf8_text(source.as_bytes()).unwrap_or("");
-            if text.trim() == "@Data()" {
-                return true;
+            let text = p.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+            if let Some(ann) = parse_annotation_text(&text) {
+                if seen_names.insert(ann.name.clone()) {
+                    annotations.push(ann);
+                }
             }
-        }
-        if p.kind().contains("definition") {
-             break;
+        } else if p.kind().contains("definition") || p.kind().contains("declaration") {
+            break;
         }
         prev = p.prev_sibling();
     }
-    
+
+    // Check parent for metadata wrappers
     if let Some(parent) = node.parent() {
-        for i in 0..parent.child_count() {
-            let child = parent.child(i as u32).unwrap();
-            if (child.kind() == "annotation" || child.kind() == "metadata") && 
-               child.utf8_text(source.as_bytes()).unwrap_or("").trim() == "@Data()" {
-                return true;
+        let mut cursor = parent.walk();
+        for child in parent.children(&mut cursor) {
+            if child.kind() == "annotation" || child.kind() == "metadata" {
+                let text = child.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+                if let Some(ann) = parse_annotation_text(&text) {
+                    if seen_names.insert(ann.name.clone()) {
+                        annotations.push(ann);
+                    }
+                }
             }
         }
     }
-    
-    false
+
+    annotations
 }
 
-/// Checks whether a class body contains a `factory ClassName.fromJson(...)` declaration.
-fn has_from_json_factory(node: Node, source: &str, class_name: &str) -> bool {
-    let class_text = node.utf8_text(source.as_bytes()).unwrap_or("");
-    let pattern = format!("{}.fromJson", class_name);
-    class_text.contains(&pattern)
+/// Parses annotation text like "@Data()" or "@SlangGen(arb: 'assets/')" into an AnnotationIR.
+fn parse_annotation_text(text: &str) -> Option<AnnotationIR> {
+    if !text.starts_with('@') {
+        return None;
+    }
+    let without_at = &text[1..];
+    let name = if let Some(paren_idx) = without_at.find('(') {
+        without_at[..paren_idx].trim().to_string()
+    } else {
+        without_at.trim().to_string()
+    };
+
+    if name.is_empty() {
+        return None;
+    }
+
+    // Named argument parsing is best-effort; full support added in future versions
+    let arguments = HashMap::new();
+
+    Some(AnnotationIR { name, arguments })
 }
 
-fn extract_data_class(node: Node, source: &str, path: std::path::PathBuf) -> Result<DataClassIR, AnalyzeError> {
-    let name_node = node.child_by_field_name("name")
+fn extract_class(
+    node: Node,
+    source: &str,
+    path: std::path::PathBuf,
+    annotations: Vec<AnnotationIR>,
+) -> Result<ClassIR, AnalyzeError> {
+    let name_node = node
+        .child_by_field_name("name")
         .ok_or_else(|| AnalyzeError::UnexpectedStructure("Class name not found".into()))?;
     let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-    
+
     let mut generics = Vec::new();
     if let Some(type_params_list) = node.child_by_field_name("type_parameters") {
         let mut cursor = type_params_list.walk();
@@ -129,40 +146,70 @@ fn extract_data_class(node: Node, source: &str, path: std::path::PathBuf) -> Res
         }
     }
 
-    let body = node.child_by_field_name("body")
+    let expected_mixin = format!("_${}", name);
+    let class_text = node.utf8_text(source.as_bytes()).unwrap_or("");
+    let has_with_mixin = check_has_with_mixin(class_text, &expected_mixin);
+
+    let body = node
+        .child_by_field_name("body")
         .ok_or_else(|| AnalyzeError::UnexpectedStructure("Class body not found".into()))?;
-    
-    // Detect user-declared fromJson factory
+
     let has_from_json = has_from_json_factory(body, source, &name);
 
     let mut fields = Vec::new();
-    let mut cursor = body.walk();
-    for member in body.children(&mut cursor) {
-        if let Some(f) = try_find_fields(member, source, &name)? {
-            fields = f;
-            break;
+    if has_with_mixin {
+        let mut cursor = body.walk();
+        for member in body.children(&mut cursor) {
+            if let Some(f) = try_find_fields(member, source, &name)? {
+                fields = f;
+                break;
+            }
         }
     }
 
-    Ok(DataClassIR {
+    Ok(ClassIR {
+        ir_version: IR_VERSION,
         name,
         generics,
         fields,
+        annotations,
         source_file: path,
+        has_with_mixin,
         has_from_json,
     })
 }
 
-/// Tries to find fields from a constructor, skipping `fromJson` factories.
-fn try_find_fields(node: Node, source: &str, class_name: &str) -> Result<Option<Vec<FieldIR>>, AnalyzeError> {
+fn check_has_with_mixin(class_text: &str, expected_mixin: &str) -> bool {
+    if let Some(with_idx) = class_text.find("with") {
+        let after_with = &class_text[with_idx + 4..];
+        if let Some(brace_idx) = after_with.find('{') {
+            let mixin_section = &after_with[..brace_idx];
+            return mixin_section.contains(expected_mixin);
+        }
+        return after_with.contains(expected_mixin);
+    }
+    false
+}
+
+fn has_from_json_factory(node: Node, source: &str, class_name: &str) -> bool {
+    let class_text = node.utf8_text(source.as_bytes()).unwrap_or("");
+    let pattern = format!("{}.fromJson", class_name);
+    class_text.contains(&pattern)
+}
+
+fn try_find_fields(
+    node: Node,
+    source: &str,
+    class_name: &str,
+) -> Result<Option<Vec<FieldIR>>, AnalyzeError> {
     let kind = node.kind();
-    if kind == "constructor_signature" || 
-       kind == "factory_constructor_declaration" || 
-       kind == "redirecting_factory_constructor_signature" ||
-       kind.contains("constructor") {
+    if kind == "constructor_signature"
+        || kind == "factory_constructor_declaration"
+        || kind == "redirecting_factory_constructor_signature"
+        || kind.contains("constructor")
+    {
         let text = node.utf8_text(source.as_bytes()).unwrap_or("");
         if text.contains("factory") {
-            // Skip fromJson factory — it's not the primary constructor
             let from_json_pattern = format!("{}.fromJson", class_name);
             if text.contains(&from_json_pattern) {
                 return Ok(None);
@@ -210,8 +257,9 @@ fn parse_parameter(node: Node, source: &str) -> Result<FieldIR, AnalyzeError> {
     let is_required = context_text.contains("required");
 
     let simple_param = if node.kind() == "default_formal_parameter" {
-        node.child_by_field_name("parameter")
-            .ok_or_else(|| AnalyzeError::UnexpectedStructure("Missing parameter in default_formal_parameter".into()))?
+        node.child_by_field_name("parameter").ok_or_else(|| {
+            AnalyzeError::UnexpectedStructure("Missing parameter in default_formal_parameter".into())
+        })?
     } else {
         node
     };
@@ -229,18 +277,18 @@ fn parse_parameter(node: Node, source: &str) -> Result<FieldIR, AnalyzeError> {
         let t_text = t.utf8_text(source.as_bytes()).unwrap_or("");
         is_nullable = t_text.ends_with('?');
         type_name = t_text.trim_end_matches('?').trim().to_string();
-        
+
         if let Some(user_type) = t.child_by_field_name("type") {
             if let Some(tn) = user_type.child_by_field_name("name") {
                 type_name = tn.utf8_text(source.as_bytes()).unwrap_or("").to_string();
             }
             if let Some(ta) = user_type.child_by_field_name("type_arguments") {
-                 let mut cursor = ta.walk();
-                 for arg in ta.children(&mut cursor) {
-                     if arg.kind() == "type_annotation" {
-                         generic_args.push(arg.utf8_text(source.as_bytes()).unwrap_or("").to_string());
-                     }
-                 }
+                let mut cursor = ta.walk();
+                for arg in ta.children(&mut cursor) {
+                    if arg.kind() == "type_annotation" {
+                        generic_args.push(arg.utf8_text(source.as_bytes()).unwrap_or("").to_string());
+                    }
+                }
             }
         }
     } else {
@@ -269,7 +317,10 @@ fn parse_parameter(node: Node, source: &str) -> Result<FieldIR, AnalyzeError> {
     }
 
     if name.is_empty() {
-        return Err(AnalyzeError::UnexpectedStructure(format!("Could not parse parameter name: {}", context_text)));
+        return Err(AnalyzeError::UnexpectedStructure(format!(
+            "Could not parse parameter name: {}",
+            context_text
+        )));
     }
 
     Ok(FieldIR {
@@ -278,7 +329,7 @@ fn parse_parameter(node: Node, source: &str) -> Result<FieldIR, AnalyzeError> {
         generic_args,
         is_required,
         is_nullable,
-        resolved_kind: TypeKind::External,
+        resolved_kind: ResolvedKind::External,
         is_generic_param: false,
     })
 }
@@ -296,12 +347,23 @@ mod tests {
         let irs = analyze(&parsed).unwrap();
         assert_eq!(irs.len(), 1);
         let ir = &irs[0];
-        
+
         assert_eq!(ir.name, "User");
         assert!(ir.has_from_json);
+        assert!(ir.has_with_mixin);
         assert_eq!(ir.fields.len(), 3);
         assert_eq!(ir.fields[0].name, "id");
         assert_eq!(ir.fields[0].type_name, "String");
         assert!(ir.fields[0].is_required);
+        assert_eq!(ir.annotations.len(), 1);
+        assert_eq!(ir.annotations[0].name, "Data");
+    }
+
+    #[test]
+    fn test_analyze_nested() {
+        let path = Path::new("testdata/nested.dart");
+        let parsed = parse_file(path).unwrap();
+        let irs = analyze(&parsed).unwrap();
+        assert_eq!(irs.len(), 2);
     }
 }
