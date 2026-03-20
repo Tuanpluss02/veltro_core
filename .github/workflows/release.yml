@@ -34,12 +34,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
-        working-directory: veltro_core
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path veltro_core/Cargo.toml --target-dir target
 
       - name: Rename binary
-        working-directory: veltro_core
-        run: cp target/${{ matrix.target }}/release/veltro ../${{ matrix.asset }}
+        run: cp "target/${{ matrix.target }}/release/veltro" "${{ matrix.asset }}"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
