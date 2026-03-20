@@ -1,7 +1,7 @@
 use crate::ir::ClassIR;
 use std::collections::HashMap;
 
-pub mod data_plugin;
+pub mod veltro_plugin;
 
 /// A file produced by a plugin.
 pub struct GeneratedFile {
@@ -13,7 +13,7 @@ pub struct GeneratedFile {
 
 /// The contract every plugin must implement.
 pub trait VeltroPlugin: Send + Sync {
-    /// Annotation name without @ or (), e.g. "Data", "SlangGen".
+    /// Annotation name without @ or (), e.g. "Veltro", "SlangGen".
     fn annotation(&self) -> &str;
 
     /// Generate file content for one annotated class.
@@ -34,7 +34,7 @@ impl PluginRegistry {
     /// Creates a registry with all built-in plugins pre-registered.
     pub fn with_defaults() -> Self {
         Self {
-            plugins: vec![Box::new(data_plugin::DataPlugin)],
+            plugins: vec![Box::new(veltro_plugin::VeltroCodePlugin)],
         }
     }
 

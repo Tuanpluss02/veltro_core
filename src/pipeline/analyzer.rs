@@ -21,6 +21,14 @@ impl fmt::Display for AnalyzeError {
 
 impl Error for AnalyzeError {}
 
+/// Default values injected when @Veltro() arguments are absent.
+const VELTRO_DEFAULTS: &[(&str, &str)] = &[
+    ("json",          "true"),
+    ("fieldRename",   "none"),
+    ("includeIfNull", "true"),
+    ("copyWith",      "true"),
+];
+
 /// Analyzes a parsed file and extracts all annotated ClassIRs.
 pub fn analyze(parsed: &ParsedFile) -> Result<Vec<ClassIR>, AnalyzeError> {
     let mut results = Vec::new();
@@ -101,26 +109,98 @@ fn collect_annotations(node: Node, source: &str) -> Vec<AnnotationIR> {
     annotations
 }
 
-/// Parses annotation text like "@Data()" or "@SlangGen(arb: 'assets/')" into an AnnotationIR.
+/// Parses annotation text like "@Veltro(json: false)" into an AnnotationIR.
 fn parse_annotation_text(text: &str) -> Option<AnnotationIR> {
     if !text.starts_with('@') {
         return None;
     }
     let without_at = &text[1..];
-    let name = if let Some(paren_idx) = without_at.find('(') {
-        without_at[..paren_idx].trim().to_string()
+    let (name, args_text) = if let Some(paren_idx) = without_at.find('(') {
+        let name = without_at[..paren_idx].trim().to_string();
+        let after_paren = &without_at[paren_idx + 1..];
+        let close_idx = after_paren.rfind(')')?;
+        let args = &after_paren[..close_idx];
+        (name, args.to_string())
     } else {
-        without_at.trim().to_string()
+        (without_at.trim().to_string(), String::new())
     };
 
     if name.is_empty() {
         return None;
     }
 
-    // Named argument parsing is best-effort; full support added in future versions
-    let arguments = HashMap::new();
+    let mut arguments: HashMap<String, String> = HashMap::new();
+
+    if name == "Veltro" {
+        if !args_text.trim().is_empty() {
+            for pair in args_text.split(',') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                if let Some(colon_idx) = pair.find(':') {
+                    let key = pair[..colon_idx].trim().to_string();
+                    let raw_value = pair[colon_idx + 1..].trim().to_string();
+
+                    // For FieldRename.snake → extract only the variant: "snake"
+                    let value = if key == "fieldRename" {
+                        if let Some(dot_idx) = raw_value.rfind('.') {
+                            raw_value[dot_idx + 1..].to_string()
+                        } else {
+                            raw_value
+                        }
+                    } else {
+                        raw_value
+                    };
+
+                    arguments.insert(key, value);
+                }
+            }
+        }
+
+        // Inject defaults for missing keys
+        for (key, default_val) in VELTRO_DEFAULTS {
+            arguments
+                .entry(key.to_string())
+                .or_insert_with(|| default_val.to_string());
+        }
+    }
 
     Some(AnnotationIR { name, arguments })
+}
+
+/// Extracts the raw value from @Default(value), e.g. "false", "ThemeMode.dark".
+fn extract_default_value(text: &str) -> Option<String> {
+    let prefix = "@Default(";
+    let start = text.find(prefix)?;
+    let after = &text[start + prefix.len()..];
+
+    let mut depth = 1usize;
+    let mut end = 0;
+    for (i, ch) in after.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if depth == 0 {
+        let val = after[..end].trim().to_string();
+        if val.is_empty() {
+            None
+        } else {
+            Some(val)
+        }
+    } else {
+        None
+    }
 }
 
 fn extract_class(
@@ -252,8 +332,16 @@ fn recursive_extract_fields(node: Node, source: &str) -> Result<Vec<FieldIR>, An
 
 fn parse_parameter(node: Node, source: &str) -> Result<FieldIR, AnalyzeError> {
     let start = node.start_byte();
-    let lookback = start.saturating_sub(10);
-    let context_text = &source[lookback..node.end_byte()];
+    // Scan back to the previous ',' or '{' to capture annotations like @Default()
+    // that precede this parameter in the source but may be outside the node span.
+    let scan_start = {
+        let prefix = &source[..start];
+        prefix.rfind([',', '{'])
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    };
+    let context_text = &source[scan_start..node.end_byte()];
+    let default_value = extract_default_value(context_text);
     let is_required = context_text.contains("required");
 
     let simple_param = if node.kind() == "default_formal_parameter" {
@@ -316,6 +404,15 @@ fn parse_parameter(node: Node, source: &str) -> Result<FieldIR, AnalyzeError> {
         }
     }
 
+    // Fallback: use context text to detect nullable types the AST may not expose
+    // (e.g. when tree-sitter puts the '?' outside the type node).
+    if !is_nullable && !type_name.is_empty() && type_name != "dynamic" {
+        let nullable_pattern = format!("{}?", type_name);
+        if context_text.contains(&nullable_pattern) {
+            is_nullable = true;
+        }
+    }
+
     if name.is_empty() {
         return Err(AnalyzeError::UnexpectedStructure(format!(
             "Could not parse parameter name: {}",
@@ -331,6 +428,7 @@ fn parse_parameter(node: Node, source: &str) -> Result<FieldIR, AnalyzeError> {
         is_nullable,
         resolved_kind: ResolvedKind::External,
         is_generic_param: false,
+        default_value,
     })
 }
 
@@ -349,14 +447,18 @@ mod tests {
         let ir = &irs[0];
 
         assert_eq!(ir.name, "User");
-        assert!(ir.has_from_json);
+        assert!(!ir.has_from_json);
         assert!(ir.has_with_mixin);
         assert_eq!(ir.fields.len(), 3);
         assert_eq!(ir.fields[0].name, "id");
         assert_eq!(ir.fields[0].type_name, "String");
         assert!(ir.fields[0].is_required);
         assert_eq!(ir.annotations.len(), 1);
-        assert_eq!(ir.annotations[0].name, "Data");
+        assert_eq!(ir.annotations[0].name, "Veltro");
+        assert_eq!(ir.annotations[0].arguments.get("json").map(|s| s.as_str()), Some("true"));
+        assert_eq!(ir.annotations[0].arguments.get("fieldRename").map(|s| s.as_str()), Some("none"));
+        assert_eq!(ir.annotations[0].arguments.get("includeIfNull").map(|s| s.as_str()), Some("true"));
+        assert_eq!(ir.annotations[0].arguments.get("copyWith").map(|s| s.as_str()), Some("true"));
     }
 
     #[test]
@@ -365,5 +467,85 @@ mod tests {
         let parsed = parse_file(path).unwrap();
         let irs = analyze(&parsed).unwrap();
         assert_eq!(irs.len(), 2);
+    }
+
+    #[test]
+    fn test_veltro_defaults_injected() {
+        let ann = parse_annotation_text("@Veltro()").unwrap();
+        assert_eq!(ann.name, "Veltro");
+        assert_eq!(ann.arguments.get("json").map(|s| s.as_str()), Some("true"));
+        assert_eq!(ann.arguments.get("fieldRename").map(|s| s.as_str()), Some("none"));
+        assert_eq!(ann.arguments.get("includeIfNull").map(|s| s.as_str()), Some("true"));
+        assert_eq!(ann.arguments.get("copyWith").map(|s| s.as_str()), Some("true"));
+    }
+
+    #[test]
+    fn test_veltro_json_false_copy_with_false() {
+        let ann = parse_annotation_text("@Veltro(json: false, copyWith: false)").unwrap();
+        assert_eq!(ann.arguments.get("json").map(|s| s.as_str()), Some("false"));
+        assert_eq!(ann.arguments.get("copyWith").map(|s| s.as_str()), Some("false"));
+        assert_eq!(ann.arguments.get("fieldRename").map(|s| s.as_str()), Some("none"));
+        assert_eq!(ann.arguments.get("includeIfNull").map(|s| s.as_str()), Some("true"));
+    }
+
+    #[test]
+    fn test_veltro_field_rename_snake() {
+        let ann = parse_annotation_text("@Veltro(fieldRename: FieldRename.snake)").unwrap();
+        assert_eq!(ann.arguments.get("fieldRename").map(|s| s.as_str()), Some("snake"));
+        assert_eq!(ann.arguments.get("json").map(|s| s.as_str()), Some("true"));
+    }
+
+    #[test]
+    fn test_extract_default_value_bool() {
+        assert_eq!(extract_default_value("@Default(false) bool isLoading"), Some("false".to_string()));
+        assert_eq!(extract_default_value("@Default(true) bool flag"), Some("true".to_string()));
+    }
+
+    #[test]
+    fn test_extract_default_value_enum() {
+        assert_eq!(
+            extract_default_value("@Default(ThemeMode.dark) ThemeMode themeMode"),
+            Some("ThemeMode.dark".to_string())
+        );
+        assert_eq!(
+            extract_default_value("@Default(ConnectivityStatus.disconnected) ConnectivityStatus connectivity"),
+            Some("ConnectivityStatus.disconnected".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_default_value_list() {
+        assert_eq!(extract_default_value("@Default([]) List<String> tags"), Some("[]".to_string()));
+    }
+
+    #[test]
+    fn test_extract_default_value_none() {
+        assert_eq!(extract_default_value("required String id"), None);
+        assert_eq!(extract_default_value("String? nickname"), None);
+    }
+
+    #[test]
+    fn test_analyze_state() {
+        let path = Path::new("testdata/state.dart");
+        let parsed = parse_file(path).unwrap();
+        let irs = analyze(&parsed).unwrap();
+        assert_eq!(irs.len(), 1);
+        let ir = &irs[0];
+        assert_eq!(ir.name, "AppState");
+        assert!(!ir.has_from_json);
+        assert!(ir.has_with_mixin);
+
+        let ann = &ir.annotations[0];
+        assert_eq!(ann.name, "Veltro");
+        assert_eq!(ann.arguments.get("json").map(|s| s.as_str()), Some("false"));
+
+        let is_loading = ir.fields.iter().find(|f| f.name == "isLoading").unwrap();
+        assert_eq!(is_loading.default_value, Some("false".to_string()));
+
+        let connectivity = ir.fields.iter().find(|f| f.name == "connectivity").unwrap();
+        assert_eq!(connectivity.default_value, Some("ConnectivityStatus.disconnected".to_string()));
+
+        let error = ir.fields.iter().find(|f| f.name == "error").unwrap();
+        assert_eq!(error.default_value, None);
     }
 }

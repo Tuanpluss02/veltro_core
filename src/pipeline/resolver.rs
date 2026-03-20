@@ -44,6 +44,7 @@ mod tests {
             is_nullable: false,
             resolved_kind: ResolvedKind::External,
             is_generic_param: false,
+            default_value: None,
         }
     }
 

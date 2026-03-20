@@ -30,6 +30,9 @@ pub struct FieldIR {
     /// The resolved kind of the type (populated in Pass 2).
     pub resolved_kind: ResolvedKind,
     pub is_generic_param: bool,
+    /// Raw default value string from @Default(), e.g. "false", "ThemeMode.dark".
+    /// None if no @Default() annotation is present.
+    pub default_value: Option<String>,
 }
 
 /// An annotation found on a Dart class.
