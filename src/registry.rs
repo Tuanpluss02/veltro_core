@@ -35,14 +35,9 @@ impl TypeRegistry {
     pub fn build(ir_list: &[ClassIR], parsed_files: &[ParsedFile]) -> Self {
         let registry: DashMap<String, ResolvedKind> = DashMap::new();
 
-        // Pass 1: Register annotated classes; @IsEnum() annotation → Enum kind
+        // Pass 1: Register all annotated classes as AnnotatedClass
         ir_list.par_iter().for_each(|ir| {
-            let has_is_enum = ir.annotations.iter().any(|a| a.name == "IsEnum");
-            if has_is_enum {
-                registry.insert(ir.name.clone(), ResolvedKind::Enum);
-            } else {
-                registry.insert(ir.name.clone(), ResolvedKind::AnnotatedClass);
-            }
+            registry.insert(ir.name.clone(), ResolvedKind::AnnotatedClass);
         });
 
         // Pass 1: Also collect native Dart enum declarations from parsed files
