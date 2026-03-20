@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
@@ -45,7 +46,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --manifest-path Cargo.toml
 
       - name: Rename binary
-        run: cp "target/${{ matrix.target }}/release/veltro" "${{ matrix.asset }}"
+        run: cp "target/${{ matrix.target }}/release/veltro_core" "${{ matrix.asset }}"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
